@@ -1,8 +1,8 @@
 particle_filter:
   ros__parameters:
     # topic names
-    scan_topic: '/scan'
-    odometry_topic: '/odom'
+    scan_topic: 'scan_filtered'  # scan
+    odometry_topic: 'odometry/local'  # odom, vehicle/vesc_odom
     # range data downsampling
     angle_step: 18
     max_particles: 4000
@@ -29,6 +29,16 @@ particle_filter:
     motion_dispersion_theta: 0.25
     # sensor model variant, variant 2 good for rmgpu, 3 doesn't work for rmgpu
     rangelib_variant: 2
+
+    # Frame IDs
+    global_frame_id: 'map'
+    # odom_frame_id: ''
+    base_frame_id: 'base_link'
+    # laser_frame_id: ''
+    publish_map_to_odom: True
+    project_to_baselink: True
+    static_laser_to_base_link: True
+    transform_tolerance: 0.5
 
 map_server:
   ros__parameters:

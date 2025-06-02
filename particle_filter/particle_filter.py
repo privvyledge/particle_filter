@@ -1,3 +1,7 @@
+"""
+Todo: get odom pose from topic if tf not present
+"""
+
 # MIT License
 
 # Copyright (c) 2020 Hongrui Zheng, Corey Walsh
@@ -23,6 +27,7 @@
 # ros2 python
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
 
 # libraries
 import numpy as np
@@ -34,7 +39,8 @@ from particle_filter import utils as Utils
 # TF
 # import tf.transformations
 # import tf
-from tf2_ros import TransformBroadcaster
+from tf2_ros import Buffer, TransformListener, TransformBroadcaster
+from tf2_ros import LookupException, ConnectivityException, ExtrapolationException
 import tf_transformations
 
 # messages
@@ -64,27 +70,35 @@ class ParticleFiler(Node):
         super().__init__('particle_filter')
 
         # declare parameters
-        self.declare_parameter('angle_step')
-        self.declare_parameter('max_particles')
-        self.declare_parameter('max_viz_particles')
-        self.declare_parameter('squash_factor')
-        self.declare_parameter('max_range')
-        self.declare_parameter('theta_discretization')
-        self.declare_parameter('range_method')
-        self.declare_parameter('rangelib_variant')
-        self.declare_parameter('fine_timing')
-        self.declare_parameter('publish_odom')
-        self.declare_parameter('viz')
-        self.declare_parameter('z_short')
-        self.declare_parameter('z_max')
-        self.declare_parameter('z_rand')
-        self.declare_parameter('z_hit')
-        self.declare_parameter('sigma_hit')
-        self.declare_parameter('motion_dispersion_x')
-        self.declare_parameter('motion_dispersion_y')
-        self.declare_parameter('motion_dispersion_theta')
-        self.declare_parameter('scan_topic')
-        self.declare_parameter('odometry_topic')
+        self.declare_parameter('angle_step', 18)
+        self.declare_parameter('max_particles', 4000)
+        self.declare_parameter('max_viz_particles', 60)
+        self.declare_parameter('squash_factor', 2.2)
+        self.declare_parameter('max_range', 10)
+        self.declare_parameter('theta_discretization', 112)
+        self.declare_parameter('range_method', 'rmgpu')
+        self.declare_parameter('rangelib_variant', 2)
+        self.declare_parameter('fine_timing', 0)
+        self.declare_parameter('publish_odom', 1)
+        self.declare_parameter('viz', 1)
+        self.declare_parameter('z_short', 0.01)
+        self.declare_parameter('z_max', 0.07)
+        self.declare_parameter('z_rand', 0.12)
+        self.declare_parameter('z_hit', 0.75)
+        self.declare_parameter('sigma_hit', 8.0)
+        self.declare_parameter('motion_dispersion_x', 0.05)
+        self.declare_parameter('motion_dispersion_y', 0.025)
+        self.declare_parameter('motion_dispersion_theta', 0.25)
+        self.declare_parameter('global_frame_id', 'map')
+        # self.declare_parameter('odom_frame_id', '')  # odom
+        self.declare_parameter('base_frame_id', 'base_link')  # 'base_link', ''
+        # self.declare_parameter('laser_frame_id', '')  # laser
+        self.declare_parameter('publish_map_to_odom', True)
+        self.declare_parameter('project_to_baselink', True)
+        self.declare_parameter('static_laser_to_base_link', True)
+        self.declare_parameter('transform_tolerance', 0.5)
+        self.declare_parameter('scan_topic', 'scan')
+        self.declare_parameter('odometry_topic', 'odom')
 
         # parameters
         self.ANGLE_STEP           = self.get_parameter('angle_step').value
@@ -110,6 +124,18 @@ class ParticleFiler(Node):
         self.MOTION_DISPERSION_X     = self.get_parameter('motion_dispersion_x').value
         self.MOTION_DISPERSION_Y     = self.get_parameter('motion_dispersion_y').value
         self.MOTION_DISPERSION_THETA = self.get_parameter('motion_dispersion_theta').value
+
+        # frame ids
+        self.GLOBAL_FRAME_ID      = self.get_parameter('global_frame_id').value
+        self.ODOM_FRAME_ID        = ''  # self.get_parameter('odom_frame_id').value
+        self.BASE_FRAME_ID   = self.get_parameter('base_frame_id').value
+        self.LASER_FRAME_ID       = ''  # self.get_parameter('laser_frame_id').value
+        self.PUBLISH_MAP_TO_ODOM = self.get_parameter('publish_map_to_odom').value
+        self.PROJECT_TO_BASELINK = self.get_parameter('project_to_baselink').value
+        self.STATIC_LASER_TO_BASE_LINK = self.get_parameter('static_laser_to_base_link').value
+        self.TRANSFORM_TOLERANCE = self.get_parameter('transform_tolerance').value
+        self.laser_to_base_link_tf = None
+        self.odom_pose = None  # used to store odom pose received from message if tf is not available
         
         # various data containers used in the MCL algorithm
         self.MAX_RANGE_PX = None
@@ -167,14 +193,16 @@ class ParticleFiler(Node):
             self.odom_pub = self.create_publisher(Odometry, '/pf/pose/odom', 1)
 
         # these topics are for coordinate space things
-        self.pub_tf = TransformBroadcaster(self)
+        self.pub_tf = TransformBroadcaster(self)  # tf broadcaster
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
 
         # these topics are to receive data from the racecar
         self.laser_sub = self.create_subscription(
             LaserScan,
             self.get_parameter('scan_topic').value,
             self.lidarCB,
-            1)
+            QoSProfile(depth=1, reliability=QoSReliabilityPolicy.BEST_EFFORT))
         self.odom_sub = self.create_subscription(
             Odometry,
             self.get_parameter('odometry_topic').value,
@@ -236,15 +264,17 @@ class ParticleFiler(Node):
         self.map_initialized = True
 
     def publish_tf(self, pose, stamp=None):
-        ''' Publish a tf for the car. This tells ROS where the car is with respect to the map. '''
-        if stamp == None:
-            stamp = self.get_clock().now().to_msg()
+        """ Publish a tf for the car. This tells ROS where the car is with respect to the map. """
+        if stamp is None:
+            stamp = self.get_clock().now()
+        else:
+            stamp = rclpy.time.Time.from_msg(stamp)
 
         t = TransformStamped()
         # header
-        t.header.stamp = stamp
-        t.header.frame_id = '/map'
-        t.child_frame_id = '/laser'
+        t.header.stamp = stamp.to_msg()
+        t.header.frame_id = self.GLOBAL_FRAME_ID
+        t.child_frame_id = self.LASER_FRAME_ID
         # translation
         t.transform.translation.x = pose[0]
         t.transform.translation.y = pose[1]
@@ -255,21 +285,168 @@ class ParticleFiler(Node):
         t.transform.rotation.y = q[1]
         t.transform.rotation.z = q[2]
         t.transform.rotation.w = q[3]
-        self.pub_tf.sendTransform(t)
+
+        # Get map -> laser transform, i.e the pose from this PF node.
+        map_laser_pos = np.array((pose[0], pose[1], 0.0))
+        map_laser_quat = tf_transformations.quaternion_from_euler(0, 0, pose[2])
+        map_laser_rotation = np.array(map_laser_quat)
+
+        map_laser_mat = tf_transformations.concatenate_matrices(
+                tf_transformations.translation_matrix(map_laser_pos),
+                tf_transformations.quaternion_matrix(map_laser_quat)
+        )
+
+        # # same as above but might be faster
+        # map_laser_matrix = tf_transformations.quaternion_matrix(map_laser_quat)
+        # map_laser_matrix[:3, 3] = map_laser_pos
+
+        if not self.PUBLISH_MAP_TO_ODOM:
+            # Apply laser -> base_link transform to map -> laser transform
+            if self.PROJECT_TO_BASELINK and (self.BASE_FRAME_ID != self.LASER_FRAME_ID):
+                if (not self.STATIC_LASER_TO_BASE_LINK) or (self.laser_to_base_link_tf is None):
+                    try:
+                        tf_stamped = self.tf_buffer.lookup_transform(
+                                self.BASE_FRAME_ID,
+                                self.LASER_FRAME_ID,
+                                rclpy.time.Time(),
+                                rclpy.duration.Duration(seconds=self.TRANSFORM_TOLERANCE))
+                        laser_bl_pos = np.array([
+                            tf_stamped.transform.translation.x,
+                            tf_stamped.transform.translation.y,
+                            tf_stamped.transform.translation.z
+                        ])
+                        laser_bl_quat = np.array([
+                            tf_stamped.transform.rotation.x,
+                            tf_stamped.transform.rotation.y,
+                            tf_stamped.transform.rotation.z,
+                            tf_stamped.transform.rotation.w
+                        ])
+
+                        # Get map -> base_link transformation via matrix multiplication and inversion
+                        laser_bl_mat = tf_transformations.concatenate_matrices(
+                                tf_transformations.translation_matrix(laser_bl_pos),
+                                tf_transformations.quaternion_matrix(laser_bl_quat)
+                        )
+                        map_bl_mat = np.dot(map_laser_mat, laser_bl_mat)
+
+                        # Extract translation and rotation back from the combined map_bl_mat
+                        map_bl_trans = tf_transformations.translation_from_matrix(map_bl_mat)
+                        map_bl_quat = tf_transformations.quaternion_from_matrix(map_bl_mat)
+
+                        t.header.stamp = (stamp + rclpy.duration.Duration(seconds=self.TRANSFORM_TOLERANCE)).to_msg()
+                        t.header.frame_id = self.GLOBAL_FRAME_ID
+                        t.child_frame_id = self.BASE_FRAME_ID
+                        t.transform.translation.x = float(map_bl_trans[0])
+                        t.transform.translation.y = float(map_bl_trans[1])
+                        t.transform.translation.z = float(map_bl_trans[2])
+                        t.transform.rotation.x = float(map_bl_quat[0])
+                        t.transform.rotation.y = float(map_bl_quat[1])
+                        t.transform.rotation.z = float(map_bl_quat[2])
+                        t.transform.rotation.w = float(map_bl_quat[3])
+                    except (LookupException, ConnectivityException, ExtrapolationException) as e:
+                        self.get_logger().warn(f'Failed to get laser→base_link: {e}')
+
+            # publish the map -> (base_link or laser) transform
+            self.pub_tf.sendTransform(t)
+
         # also publish odometry to facilitate getting the localization pose
         if self.PUBLISH_ODOM:
             odom = Odometry()
-            odom.header.stamp = self.get_clock().now().to_msg()
-            odom.header.frame_id = '/map'
-            odom.pose.pose.position.x = pose[0]
-            odom.pose.pose.position.y = pose[1]
-            odom.pose.pose.orientation = Utils.angle_to_quaternion(pose[2])
+            odom.header.stamp = stamp.to_msg()
+            odom.header.frame_id = self.GLOBAL_FRAME_ID
+            if self.PROJECT_TO_BASELINK and (self.BASE_FRAME_ID != self.LASER_FRAME_ID) and (not self.PUBLISH_MAP_TO_ODOM):
+                odom.child_frame_id = self.BASE_FRAME_ID
+                odom.pose.pose.position.x = float(map_bl_trans[0])
+                odom.pose.pose.position.y = float(map_bl_trans[1])
+                odom.pose.pose.position.z = float(map_bl_trans[2])
+                odom.pose.pose.orientation.x = float(map_bl_quat[0])
+                odom.pose.pose.orientation.y = float(map_bl_quat[1])
+                odom.pose.pose.orientation.z = float(map_bl_quat[2])
+                odom.pose.pose.orientation.w = float(map_bl_quat[3])
+            else:
+                odom.child_frame_id = self.LASER_FRAME_ID
+                odom.pose.pose.position.x = pose[0]
+                odom.pose.pose.position.y = pose[1]
+                odom.pose.pose.orientation = Utils.angle_to_quaternion(pose[2])
+
             cov_mat = np.cov(self.particles, rowvar=False, ddof=0, aweights=self.weights).flatten()
             odom.pose.covariance[:cov_mat.shape[0]] = cov_mat
             odom.twist.twist.linear.x = self.current_speed
             self.odom_pub.publish(odom)
-        
-        return
+
+        if self.PUBLISH_MAP_TO_ODOM:
+            """
+            Our particle filter provides estimates for the "laser" frame
+            since that is where our laser range estimates are measured from. Thus,
+            we want to publish a "map" -> "laser" transform.
+    
+            However, the car's position is measured with respect to the "base_link"
+            frame (it is the root of the TF tree). Thus, we should actually define
+            a "map" -> "base_link" transform as to not break the TF tree.
+            """
+
+            # Lookup laser → odom transform
+            # Note: we could also get the current map->base_link transform by transforming the odom pose to the map frame
+            try:
+                # target_frame='odom', source_frame='laser'
+                trans = self.tf_buffer.lookup_transform(
+                        self.ODOM_FRAME_ID, self.LASER_FRAME_ID, # works for laser -> (base_link) -> odom
+                        rclpy.time.Time(),
+                        rclpy.duration.Duration(seconds=self.TRANSFORM_TOLERANCE))
+                laser_odom_pos = np.array([
+                    trans.transform.translation.x,
+                    trans.transform.translation.y,
+                    trans.transform.translation.z
+                ])
+                laser_odom_quat = np.array([
+                    trans.transform.rotation.x,
+                    trans.transform.rotation.y,
+                    trans.transform.rotation.z,
+                    trans.transform.rotation.w
+                ])
+            except (LookupException, ConnectivityException, ExtrapolationException) as e:
+                self.get_logger().warn(f'Could not get laser→odom transform: {e}')
+                # get odom pose from message
+                if self.odom_pose is None:
+                    self.pub_tf.sendTransform(t)
+                    return
+                laser_odom_pos = np.array([
+                    self.odom_pose.position.x,
+                    self.odom_pose.position.y,
+                    self.odom_pose.position.z
+                ])
+                laser_odom_quat = np.array([
+                    self.odom_pose.orientation.x,
+                    self.odom_pose.orientation.y,
+                    self.odom_pose.orientation.z,
+                    self.odom_pose.orientation.w
+                ])
+
+            # Get map -> odom transformation via matrix multiplication and inversion
+            laser_odom_mat = tf_transformations.concatenate_matrices(
+                    tf_transformations.translation_matrix(laser_odom_pos),
+                    tf_transformations.quaternion_matrix(laser_odom_quat)
+            )
+            map_odom_mat = np.dot(map_laser_mat, laser_odom_mat)
+
+            map_odom_trans = tf_transformations.translation_from_matrix(map_odom_mat)
+            map_odom_quat = tf_transformations.quaternion_from_matrix(map_odom_mat)
+
+            # Publish map -> odom transform
+            tfs = TransformStamped()
+            tfs.header.stamp = (stamp + rclpy.duration.Duration(seconds=self.TRANSFORM_TOLERANCE)).to_msg()
+            tfs.header.frame_id = self.GLOBAL_FRAME_ID
+            tfs.child_frame_id = self.ODOM_FRAME_ID
+            tfs.transform.translation.x = float(map_odom_trans[0])
+            tfs.transform.translation.y = float(map_odom_trans[1])
+            tfs.transform.translation.z = float(map_odom_trans[2])
+            tfs.transform.rotation.x = float(map_odom_quat[0])
+            tfs.transform.rotation.y = float(map_odom_quat[1])
+            tfs.transform.rotation.z = float(map_odom_quat[2])
+            tfs.transform.rotation.w = float(map_odom_quat[3])
+
+            # publish the transform
+            self.pub_tf.sendTransform(tfs)
 
     def visualize(self):
         '''
@@ -282,7 +459,7 @@ class ParticleFiler(Node):
             # Publish the inferred pose for visualization
             ps = PoseStamped()
             ps.header.stamp = self.get_clock().now().to_msg()
-            ps.header.frame_id = '/map'
+            ps.header.frame_id = self.GLOBAL_FRAME_ID
             ps.pose.position.x = self.inferred_pose[0]
             ps.pose.position.y = self.inferred_pose[1]
             ps.pose.orientation = Utils.angle_to_quaternion(self.inferred_pose[2])
@@ -310,7 +487,7 @@ class ParticleFiler(Node):
         # publish the given particles as a PoseArray object
         pa = PoseArray()
         pa.header.stamp = self.get_clock().now().to_msg()
-        pa.header.frame_id = '/map'
+        pa.header.frame_id = self.GLOBAL_FRAME_ID
         pa.poses = Utils.particles_to_poses(particles)
         self.particle_pub.publish(pa)
 
@@ -318,19 +495,20 @@ class ParticleFiler(Node):
         # publish the given angels and ranges as a laser scan message
         ls = LaserScan()
         ls.header.stamp = self.last_stamp
-        ls.header.frame_id = '/laser'
-        ls.angle_min = np.min(angles)
-        ls.angle_max = np.max(angles)
-        ls.angle_increment = np.abs(angles[0] - angles[1])
-        ls.range_min = 0
-        ls.range_max = np.max(ranges)
-        ls.ranges = ranges
+        ls.header.frame_id = self.LASER_FRAME_ID
+        ls.angle_min = np.min(angles).astype(float)
+        ls.angle_max = np.max(angles).astype(float)
+        ls.angle_increment = np.abs(angles[0] - angles[1]).astype(float)
+        ls.range_min = 0.0
+        ls.range_max = np.max(ranges).astype(float)
+        ls.ranges = ranges.tolist()
         self.pub_fake_scan.publish(ls)
 
     def lidarCB(self, msg):
-        '''
+        """
         Initializes reused buffers, and stores the relevant laser scanner data for later use.
-        '''
+        """
+        self.LASER_FRAME_ID = msg.header.frame_id
         if not isinstance(self.laser_angles, np.ndarray):
             self.get_logger().info('...Received first LiDAR message')
             self.laser_angles = np.linspace(msg.angle_min, msg.angle_max, len(msg.ranges))
@@ -345,11 +523,15 @@ class ParticleFiler(Node):
         # self.update()
 
     def odomCB(self, msg):
-        '''
+        """
         Store deltas between consecutive odometry messages in the coordinate space of the car.
 
         Odometry data is accumulated via dead reckoning, so it is very inaccurate on its own.
-        '''
+        """
+        self.BASE_FRAME_ID = msg.child_frame_id
+        self.ODOM_FRAME_ID = msg.header.frame_id
+        self.odom_pose = msg.pose.pose
+
         position = np.array([
             msg.pose.pose.position.x,
             msg.pose.pose.position.y])
