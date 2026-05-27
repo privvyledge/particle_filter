@@ -10,7 +10,7 @@
 /**:
   ros__parameters:
     # YDLIDAR X4 max range (m)
-    max_range: 10
+    max_range: 10.0
 
     # step=18 → ~35 beams per scan at 625 beams/rev
     angle_step: 18

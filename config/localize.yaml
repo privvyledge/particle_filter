@@ -25,7 +25,7 @@
     range_method: 'rmgpu'
     theta_discretization: 112  # todo (test) 150 (ForzaETH)
     # range data filtering — YDLIDAR X4 max range (m)
-    max_range: 10  # YDLIDAR X4
+    max_range: 10.0  # YDLIDAR X4
     fine_timing: 0
     publish_odom: 1
     # MCL update rate in Hz; decoupled from odometry topic rate (P-2)

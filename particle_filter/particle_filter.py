@@ -66,7 +66,7 @@ class ParticleFilter(Node):
         self.declare_parameter('max_particles', 4000)
         self.declare_parameter('max_viz_particles', 60)
         self.declare_parameter('squash_factor', 2.2)
-        self.declare_parameter('max_range', 10)
+        self.declare_parameter('max_range', 10.0)
         self.declare_parameter('theta_discretization', 112)
         self.declare_parameter('range_method', 'rmgpu')
         self.declare_parameter('rangelib_variant', 2)
@@ -845,6 +845,13 @@ class ParticleFilter(Node):
             odom.pose.pose.orientation = Quaternion(
                 x=float(quat[0]), y=float(quat[1]),
                 z=float(quat[2]), w=float(quat[3]))
+            # Map 3×3 (x, y, θ) particle covariance → 6×6 ROS pose covariance
+            # Row/col order: [x, y, z, roll, pitch, yaw]; θ lives at index 5.
+            cov_6x6 = np.zeros((6, 6))
+            c = self.cov_3x3
+            cov_6x6[0, 0] = c[0, 0]; cov_6x6[0, 1] = c[0, 1]; cov_6x6[0, 5] = c[0, 2]
+            cov_6x6[1, 0] = c[1, 0]; cov_6x6[1, 1] = c[1, 1]; cov_6x6[1, 5] = c[1, 2]
+            cov_6x6[5, 0] = c[2, 0]; cov_6x6[5, 1] = c[2, 1]; cov_6x6[5, 5] = c[2, 2]
             odom.pose.covariance = cov_6x6.flatten().tolist()
             odom.twist.twist.linear.x = self.current_speed
             self.odom_pub.publish(odom)
