@@ -32,6 +32,8 @@
     mcl_hz: 40.0
     # seconds; MCL skips cycle if scan is older than this (F-4)
     scan_max_age: 0.5
+    # seconds; MCL skips cycle if odom is older than this (publisher died after init)
+    odom_max_age: 0.5
     # sensor model constants (YDLIDAR X4 tuned values)
     z_short: 0.01    # YDLIDAR X4: low glass/crosstalk return probability
     z_max: 0.07      # YDLIDAR X4: occasional max-range misses

@@ -87,6 +87,7 @@ class ParticleFilter(Node):
         self.declare_parameter('odometry_topic', 'odom')
         self.declare_parameter('scan_qos_reliability', 'best_effort')
         self.declare_parameter('scan_max_age', 0.5)
+        self.declare_parameter('odom_max_age', 0.5)
         self.declare_parameter('mcl_hz', 40.0)
         self.declare_parameter('global_frame_id', 'map')
         self.declare_parameter('odom_frame_id', '')
@@ -138,6 +139,7 @@ class ParticleFilter(Node):
         self.tf_broadcast = self.get_parameter('tf_broadcast').value
         self.set_initial_pose = self.get_parameter('set_initial_pose').value
         self.SCAN_MAX_AGE_SEC = self.get_parameter('scan_max_age').value
+        self.ODOM_MAX_AGE_SEC = self.get_parameter('odom_max_age').value
         self.MCL_HZ = self.get_parameter('mcl_hz').value
         scan_qos_rel_str = self.get_parameter('scan_qos_reliability').value
         self.GLOBAL_LOC_COARSE_RES = self.get_parameter('global_loc_coarse_res').value
@@ -187,6 +189,7 @@ class ParticleFilter(Node):
 
         # F-4: scan staleness tracking
         self._last_scan_stamp = None
+        self._last_odom_stamp = None
 
         # E-5: range_min populated from each scan message
         self._range_min = 0.0
@@ -677,6 +680,7 @@ class ParticleFilter(Node):
                 self.odometry_data[2] += Utils.angle_diff(orientation, self.last_pose[2])
                 self.last_pose = pose
                 self.last_stamp = msg.header.stamp
+                self._last_odom_stamp = msg.header.stamp
                 self.odom_initialized = True
             else:
                 self.get_logger().info('Received first Odometry message')
@@ -713,6 +717,15 @@ class ParticleFilter(Node):
             if age > self.SCAN_MAX_AGE_SEC:
                 self.get_logger().warn(
                     f'Stale scan ({age:.2f}s > {self.SCAN_MAX_AGE_SEC}s); skipping MCL')
+                return
+
+        # skip cycle if odom is stale (publisher died after init)
+        if self._last_odom_stamp is not None:
+            age = (self.get_clock().now()
+                   - rclpy.time.Time.from_msg(self._last_odom_stamp)).nanoseconds * 1e-9
+            if age > self.ODOM_MAX_AGE_SEC:
+                self.get_logger().warn(
+                    f'Stale odom ({age:.2f}s > {self.ODOM_MAX_AGE_SEC}s); skipping MCL')
                 return
 
         self.update()
