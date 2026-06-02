@@ -83,9 +83,15 @@ class ParticleFilter(Node):
         self.declare_parameter('motion_dispersion_x', 0.05)
         self.declare_parameter('motion_dispersion_y', 0.025)
         self.declare_parameter('motion_dispersion_theta', 0.25)
+        # Motion gate (AMCL update_min_d/_a): skip resample+motion-noise when the
+        # accumulated odom delta is below these, so a stationary robot does not
+        # random-walk from per-tick noise. 0.0 disables the gate (update every tick).
+        self.declare_parameter('update_min_d', 0.02)
+        self.declare_parameter('update_min_a', 0.01)
         self.declare_parameter('scan_topic', 'scan')
         self.declare_parameter('odometry_topic', 'odom')
         self.declare_parameter('scan_qos_reliability', 'best_effort')
+        self.declare_parameter('odom_qos_reliability', 'reliable')
         self.declare_parameter('scan_max_age', 0.5)
         self.declare_parameter('odom_max_age', 0.5)
         self.declare_parameter('mcl_hz', 40.0)
@@ -94,7 +100,20 @@ class ParticleFilter(Node):
         self.declare_parameter('base_frame_id', 'base_link')
         self.declare_parameter('static_laser_to_base_link', True)
         self.declare_parameter('transform_tolerance', 0.5)
+        # TF republish is normally driven by the odom rate (we publish whenever the
+        # odom stamp advances), which avoids TF_REPEATED_DATA drops when the MCL
+        # timer runs faster than odom. The heartbeat re-stamps the last transform if
+        # this many seconds pass with no fresh odom, so map->odom does not expire
+        # while odom is slow (but still alive). 0.0 disables it.
+        self.declare_parameter('tf_heartbeat_period', 0.2)
         self.declare_parameter('tf_broadcast', True)
+        # Comparison aid (non-standard, default off): in map->base mode, freeze the
+        # map->odom correction at the first fix and express the published pose
+        # relative to the odom origin, so pf/pose/odom starts coincident with raw
+        # odometry and diverges only by the drift the PF corrects. AMCL never does
+        # this (it publishes a live map->odom TF); only enable for offline odom-vs-PF
+        # trajectory comparison. Requires base_frame_id set (map->base mode).
+        self.declare_parameter('anchor_to_odom_origin', False)
         self.declare_parameter('set_initial_pose', False)
         self.declare_parameter('initial_pose.x', 0.0)
         self.declare_parameter('initial_pose.y', 0.0)
@@ -130,24 +149,41 @@ class ParticleFilter(Node):
         self.MOTION_DISPERSION_X = self.get_parameter('motion_dispersion_x').value
         self.MOTION_DISPERSION_Y = self.get_parameter('motion_dispersion_y').value
         self.MOTION_DISPERSION_THETA = self.get_parameter('motion_dispersion_theta').value
+        self.UPDATE_MIN_D = self.get_parameter('update_min_d').value
+        self.UPDATE_MIN_A = self.get_parameter('update_min_a').value
         self.GLOBAL_FRAME_ID = self.get_parameter('global_frame_id').value
         self.ODOM_FRAME_ID = self.get_parameter('odom_frame_id').value
         self.BASE_FRAME_ID = self.get_parameter('base_frame_id').value
         self.LASER_FRAME_ID = ''
         self.STATIC_LASER_TO_BASE_LINK = self.get_parameter('static_laser_to_base_link').value
         self.TRANSFORM_TOLERANCE = self.get_parameter('transform_tolerance').value
+        self.TF_HEARTBEAT_PERIOD = self.get_parameter('tf_heartbeat_period').value
         self.tf_broadcast = self.get_parameter('tf_broadcast').value
+        self.ANCHOR_TO_ODOM_ORIGIN = self.get_parameter('anchor_to_odom_origin').value
         self.set_initial_pose = self.get_parameter('set_initial_pose').value
         self.SCAN_MAX_AGE_SEC = self.get_parameter('scan_max_age').value
         self.ODOM_MAX_AGE_SEC = self.get_parameter('odom_max_age').value
         self.MCL_HZ = self.get_parameter('mcl_hz').value
         scan_qos_rel_str = self.get_parameter('scan_qos_reliability').value
+        odom_qos_rel_str = self.get_parameter('odom_qos_reliability').value
         self.GLOBAL_LOC_COARSE_RES = self.get_parameter('global_loc_coarse_res').value
         self.GLOBAL_LOC_THETA_RES = self.get_parameter('global_loc_theta_res').value
         self.GLOBAL_LOC_TOP_K = self.get_parameter('global_loc_top_k').value
         self.GLOBAL_LOC_MIN_DIST = self.get_parameter('global_loc_min_dist').value
         self.GLOBAL_LOC_MAX_CANDIDATES = self.get_parameter('global_loc_max_candidates').value
         self.GLOBAL_LOC_TIMEOUT = self.get_parameter('global_loc_timeout').value
+
+        # anchor_to_odom_origin only takes effect in map→base mode; warn if the
+        # configured frames will select map→odom or the map→laser fallback instead.
+        if self.ANCHOR_TO_ODOM_ORIGIN:
+            _will_be_base = bool(self.BASE_FRAME_ID) and not (
+                self.ODOM_FRAME_ID and self.ODOM_FRAME_ID != self.GLOBAL_FRAME_ID)
+            if not _will_be_base:
+                self.get_logger().warn(
+                    'anchor_to_odom_origin is set but the frame config does not '
+                    'select map→base mode (need base_frame_id set and '
+                    'odom_frame_id empty/equal to global_frame_id); anchoring '
+                    'will be ignored')
 
         # E-7: reproducible RNG seed
         seed = self.get_parameter('seed').value
@@ -179,6 +215,9 @@ class ParticleFilter(Node):
         self.last_pose = None
         self.odom_pose = None
         self.current_speed = 0.0
+        # Frozen inv(map->odom) correction for anchor_to_odom_origin; set once at
+        # the first map->base publish, then held constant.
+        self._odom_anchor_inv = None
         self.cov_3x3 = np.zeros((3, 3))
 
         # F-3: readiness flags; MCL timer checks all before running
@@ -190,6 +229,13 @@ class ParticleFilter(Node):
         # F-4: scan staleness tracking
         self._last_scan_stamp = None
         self._last_odom_stamp = None
+
+        # TF publish pacing: republish only when the odom stamp advances (tracks the
+        # odom rate, not the MCL timer) plus a low-rate heartbeat to keep map->odom
+        # alive when odom is slow. _last_tf_pub_time is wall/sim time of the last
+        # broadcast; None until the first publish.
+        self._last_published_stamp = None
+        self._last_tf_pub_time = None
 
         # E-5: range_min populated from each scan message
         self._range_min = 0.0
@@ -277,10 +323,13 @@ class ParticleFilter(Node):
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
-        # ── scan QoS (P-9) ────────────────────────────────────────────────────
+        # ── scan / odom QoS ───────────────────────────────────────────────────
         qos_rel = (QoSReliabilityPolicy.BEST_EFFORT
                    if scan_qos_rel_str.lower() == 'best_effort'
                    else QoSReliabilityPolicy.RELIABLE)
+        odom_qos_rel = (QoSReliabilityPolicy.BEST_EFFORT
+                        if odom_qos_rel_str.lower() == 'best_effort'
+                        else QoSReliabilityPolicy.RELIABLE)
 
         # ── subscribers ───────────────────────────────────────────────────────
         self.laser_sub = self.create_subscription(
@@ -289,12 +338,12 @@ class ParticleFilter(Node):
             self.lidarCB,
             QoSProfile(depth=1, reliability=qos_rel),
             callback_group=self._lidar_group)
-        # Fix 1: depth=10 so odom messages queued during ~25 ms MCL cycle are not dropped
+        # depth=10: buffers odom messages queued during ~25 ms MCL cycle
         self.odom_sub = self.create_subscription(
             Odometry,
             self.get_parameter('odometry_topic').value,
             self.odomCB,
-            10,
+            QoSProfile(depth=10, reliability=odom_qos_rel),
             callback_group=self._odom_group)
         self.pose_sub = self.create_subscription(
             PoseWithCovarianceStamped, 'initialpose', self.clicked_pose, 1,
@@ -598,7 +647,16 @@ class ParticleFilter(Node):
                     'filter may be degenerate')
 
     def expected_pose(self):
-        return np.dot(self.particles.T, self.weights)
+        # x, y: weighted linear mean. theta: weighted *circular* mean — a linear
+        # average is wrong across the ±pi wrap and biased whenever the cloud is
+        # spread in heading, which corrupts the published yaw.
+        pose = np.empty(3)
+        pose[0] = np.dot(self.particles[:, 0], self.weights)
+        pose[1] = np.dot(self.particles[:, 1], self.weights)
+        pose[2] = np.arctan2(
+            np.dot(np.sin(self.particles[:, 2]), self.weights),
+            np.dot(np.cos(self.particles[:, 2]), self.weights))
+        return pose
 
     # ── callbacks ─────────────────────────────────────────────────────────────
 
@@ -739,34 +797,94 @@ class ParticleFilter(Node):
             return
 
         with self.state_lock:
-            self.timer.tick()
-            self.iters += 1
-            t1 = time.time()
-
             observation = np.copy(self.downsampled_ranges).astype(np.float32)
             with self._odom_lock:
                 action = np.copy(self.odometry_data)
-                self.odometry_data[:] = 0.0
+                # Motion gate: only consume the accumulated delta (and run MCL) once
+                # the robot has moved past update_min_d / update_min_a. Otherwise keep
+                # accumulating so no motion is lost, and skip resample+noise this tick.
+                # Force the first cycle so inferred_pose / TF get established at startup.
+                moved = (abs(action[0]) > self.UPDATE_MIN_D
+                         or abs(action[1]) > self.UPDATE_MIN_D
+                         or abs(action[2]) > self.UPDATE_MIN_A
+                         or self.inferred_pose is None)
+                if moved:
+                    self.odometry_data[:] = 0.0
                 last_stamp = self.last_stamp
 
-            self.MCL(action, observation)
-            self.inferred_pose = self.expected_pose()
-            t2 = time.time()
+            if moved:
+                self.timer.tick()
+                self.iters += 1
+                t1 = time.time()
+                self.MCL(action, observation)
+                self.inferred_pose = self.expected_pose()
+                t2 = time.time()
 
-        self.publish_tf(self.inferred_pose, last_stamp)
+        # Publish TF at the odom rate, not the MCL timer rate: broadcast whenever the
+        # odom stamp advances (so a 40 Hz timer over a 30 Hz odom does not re-send a
+        # stale stamp → TF_REPEATED_DATA). A heartbeat re-stamps the last transform if
+        # too long passes with no fresh odom, keeping map→odom from expiring while odom
+        # is slow but alive (the odom-staleness guard in the timer cb still stops
+        # publishing once odom dies). The odom topic is published only on a real fix.
+        if self.inferred_pose is not None:
+            now_time = self.get_clock().now()
+            stamp_changed = (last_stamp is not None
+                             and last_stamp != self._last_published_stamp)
+            heartbeat_due = (
+                self.TF_HEARTBEAT_PERIOD > 0.0
+                and (self._last_tf_pub_time is None
+                     or (now_time - self._last_tf_pub_time).nanoseconds * 1e-9
+                     >= self.TF_HEARTBEAT_PERIOD))
+            if stamp_changed or heartbeat_due:
+                # On a pure heartbeat (no new odom) re-stamp with the current time so
+                # the forward-dated transform keeps advancing; otherwise use the odom
+                # stamp the pose is associated with.
+                pub_stamp = last_stamp if stamp_changed else now_time.to_msg()
+                self.publish_tf(self.inferred_pose, pub_stamp,
+                                publish_odom_topic=moved)
+                self._last_published_stamp = last_stamp
+                self._last_tf_pub_time = now_time
 
-        ips = 1.0 / (t2 - t1)
-        self.smoothing.append(ips)
-        if self.iters % 10 == 0:
-            self.get_logger().info(
-                f'MCL iters/s: {int(self.timer.fps())} '
-                f'(possible: {int(self.smoothing.mean())})')
+        if moved:
+            ips = 1.0 / (t2 - t1)
+            self.smoothing.append(ips)
+            if self.iters % 10 == 0:
+                self.get_logger().info(
+                    f'MCL iters/s: {int(self.timer.fps())} '
+                    f'(possible: {int(self.smoothing.mean())})')
 
         self.visualize()
 
     # ── TF / pose publishing ──────────────────────────────────────────────────
 
-    def publish_tf(self, pose, stamp=None):
+    def _anchor_to_odom_origin(self, T_map_base):
+        """
+        Express a map→base_link pose relative to the odom origin (comparison aid).
+
+        Freezes the map→odom correction C = T_map_base · inv(T_odom_base) at the
+        first valid fix, then returns inv(C) · T_map_base. At t0 this equals
+        T_odom_base exactly, so the published pose starts coincident with raw
+        odometry and afterwards diverges only by the drift the PF corrects.
+        C is held constant after the first call (a static rigid alignment, not a
+        feedback loop). Returns the input unchanged if odom is not available yet.
+        """
+        if self._odom_anchor_inv is None:
+            if self.odom_pose is None:
+                return T_map_base  # odom not ready; publish unanchored this once
+            T_odom_base0 = pose_msg_to_matrix(self.odom_pose)
+            # Analytical SE(3) inverse of the frozen T_map_base (R^T | -R^T·t);
+            # inv(C) = T_odom_base0 · inv(T_map_base0) = T_odom_map at t0.
+            _R = T_map_base[:3, :3]
+            inv_T_map_base0 = np.eye(4)
+            inv_T_map_base0[:3, :3] = _R.T
+            inv_T_map_base0[:3, 3] = -(_R.T @ T_map_base[:3, 3])
+            self._odom_anchor_inv = T_odom_base0 @ inv_T_map_base0
+            self.get_logger().info(
+                'anchor_to_odom_origin: froze map→odom correction; pose now '
+                'expressed relative to the odom origin')
+        return self._odom_anchor_inv @ T_map_base
+
+    def publish_tf(self, pose, stamp=None, publish_odom_topic=True):
         """
         Publish the localisation result as a TF transform and (optionally) Odometry.
 
@@ -784,8 +902,10 @@ class ParticleFilter(Node):
         else:
             stamp = rclpy.time.Time.from_msg(stamp)
 
-        # Fix 2: skip np.cov when nobody is subscribed to the odom topic
-        if self.PUBLISH_ODOM and self.odom_pub.get_subscription_count() > 0:
+        # Fix 2: skip np.cov when nobody is subscribed to the odom topic, or when this
+        # call is not publishing the odom topic (heartbeat / non-fix republish)
+        if (publish_odom_topic and self.PUBLISH_ODOM
+                and self.odom_pub.get_subscription_count() > 0):
             self.cov_3x3 = np.cov(self.particles, rowvar=False, ddof=0, aweights=self.weights)
 
         q_ms = quaternion_from_euler(0.0, 0.0, pose[2])
@@ -833,6 +953,8 @@ class ParticleFilter(Node):
                 return
             T_publish = self.T_map_to_scan @ self.laser_to_base_frame_tf
             publish_child = self.BASE_FRAME_ID
+            if self.ANCHOR_TO_ODOM_ORIGIN:
+                T_publish = self._anchor_to_odom_origin(T_publish)
 
         else:
             # ── map → laser fallback ──────────────────────────────────────────
@@ -846,7 +968,7 @@ class ParticleFilter(Node):
                 matrix_to_transformstamped(
                     T_publish, self.GLOBAL_FRAME_ID, publish_child, stamp_fwd))
 
-        if self.PUBLISH_ODOM:
+        if publish_odom_topic and self.PUBLISH_ODOM:
             quat = quaternion_from_matrix(T_publish[:3, :3])
             odom = Odometry()
             odom.header.stamp = stamp.to_msg()
